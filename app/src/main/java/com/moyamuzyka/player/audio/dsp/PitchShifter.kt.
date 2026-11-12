@@ -1,0 +1,141 @@
+package com.moyamuzyka.player.audio.dsp
+
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.floor
+import kotlin.math.pow
+import kotlin.math.sqrt
+
+/**
+ * «Голос» из Лаборатории: сдвиг высоты тона без изменения скорости, −12..+12 полутонов.
+ * Порт mkShift из HTML-эталона (две линии задержки с пилообразной модуляцией и перекрёстным
+ * затуханием по закону равной мощности).
+ *
+ * Схема эталона:
+ *  - Окно BT = 0.1 с. Два «зерна», сдвинутых на половину окна (0.05 с), у каждого своя линия задержки.
+ *  - Время задержки зерна = A * пила, где пила идёт 0→1 (вниз по высоте) или 1→0 (вверх по высоте).
+ *  - A = |R − 1| * BT для сдвига вверх и (1 − R) * BT для сдвига вниз, R = 2^(полутона / 12).
+ *    Скорость изменения задержки равна |R − 1|, значит высота тона умножается ровно на R.
+ *  - Окно зерна: sqrt(2p) на первой половине периода и sqrt(2 − 2p) на второй (сумма мощностей = 1).
+ *  - Сухой / обработанный сигналы и все гейны меняются плавно (tau 30 мс). При 0 полутонов
+ *    слышен только сухой сигнал.
+ *
+ * Для 0 полутонов линии задержки продолжают заполняться, поэтому включение эффекта сразу готово.
+ * Формат: interleaved float, на месте, любое число каналов (задержка у каналов общая).
+ * [setSemitones] можно вызывать из любого потока, [process] и [reset] — из аудио-потока.
+ */
+class PitchShifter(private val channels: Int, private val sampleRate: Int) {
+
+    @Volatile private var semitones = 0
+    private var appliedSemitones = 0
+
+    private val size = (MAX_DELAY_S * sampleRate).toInt() + 8
+    private val lines = Array(channels) { FloatArray(size) }
+    private var writePos = 0
+
+    private val phaseInc = 1.0 / (WINDOW_S * sampleRate)
+    private var phase = 0.0
+
+    private val k = 1.0 - exp(-1.0 / (TAU_S * sampleRate))
+
+    // Текущие значения и цели: сухой, обработанный, гейн «вниз», гейн «вверх», глубина A (секунды)
+    private var dryC = 1.0; private var dryT = 1.0
+    private var wetC = 0.0; private var wetT = 0.0
+    private var downC = 1.0; private var downT = 1.0
+    private var upC = 0.0; private var upT = 0.0
+    private var depthC = 0.0; private var depthT = 0.0
+
+    fun setSemitones(value: Int) {
+        semitones = value.coerceIn(-12, 12)
+    }
+
+    fun reset() {
+        for (l in lines) l.fill(0f)
+        writePos = 0
+        phase = 0.0
+    }
+
+    fun process(data: FloatArray, frames: Int) {
+        val st = semitones
+        if (st != appliedSemitones) applySemitones(st)
+
+        val idle = st == 0 && dryC == 1.0 && wetC == 0.0
+        var idx = 0
+        for (i in 0 until frames) {
+            if (idle) {
+                // Только заполняем линии задержки и крутим фазу
+                for (c in 0 until channels) lines[c][writePos] = data[idx + c]
+                idx += channels
+            } else {
+                dryC += (dryT - dryC) * k
+                wetC += (wetT - wetC) * k
+                downC += (downT - downC) * k
+                upC += (upT - upC) * k
+                depthC += (depthT - depthC) * k
+
+                val p1 = phase
+                val p2 = if (phase >= 0.5) phase - 0.5 else phase + 0.5
+                val d1 = depthC * (downC * p1 + upC * (1.0 - p1)) * sampleRate
+                val d2 = depthC * (downC * p2 + upC * (1.0 - p2)) * sampleRate
+                val w1 = window(p1)
+                val w2 = window(p2)
+
+                for (c in 0 until channels) {
+                    val line = lines[c]
+                    val x = data[idx + c]
+                    line[writePos] = x
+                    val y = read(line, d1) * w1 + read(line, d2) * w2
+                    data[idx + c] = (dryC * x + wetC * y).toFloat()
+                }
+                idx += channels
+
+                if (st == 0 && abs(dryC - 1.0) < SNAP && wetC < SNAP) {
+                    dryC = 1.0; wetC = 0.0
+                }
+            }
+            writePos++
+            if (writePos == size) writePos = 0
+            phase += phaseInc
+            if (phase >= 1.0) phase -= 1.0
+        }
+    }
+
+    private fun applySemitones(st: Int) {
+        appliedSemitones = st
+        if (st == 0) {
+            dryT = 1.0
+            wetT = 0.0
+            return
+        }
+        val r = 2.0.pow(st / 12.0)
+        val up = st > 0
+        depthT = abs(if (up) r - 1.0 else 1.0 - r) * WINDOW_S
+        downT = if (up) 0.0 else 1.0
+        upT = if (up) 1.0 else 0.0
+        dryT = 0.0
+        wetT = 1.0
+    }
+
+    /** Чтение из линии с линейной интерполяцией на [delaySamples] кадров назад от текущей записи. */
+    private fun read(line: FloatArray, delaySamples: Double): Double {
+        val d = if (delaySamples < 0.0) 0.0 else delaySamples
+        val pos = writePos - d
+        val base = floor(pos)
+        val frac = pos - base
+        var i0 = base.toInt()
+        while (i0 < 0) i0 += size
+        val i1 = if (i0 + 1 == size) 0 else i0 + 1
+        // i0 — более старый сэмпл, i1 — на кадр новее
+        return line[i0] * (1.0 - frac) + line[i1] * frac
+    }
+
+    private fun window(p: Double): Double =
+        if (p < 0.5) sqrt(p * 2.0) else sqrt(2.0 - 2.0 * p)
+
+    private companion object {
+        const val WINDOW_S = 0.1       // BT в эталоне
+        const val MAX_DELAY_S = 0.12   // максимум A = 0.1 с (+12 полутонов), запас
+        const val TAU_S = 0.03
+        const val SNAP = 1e-6
+    }
+}
