@@ -1,8 +1,10 @@
 package com.moyamuzyka.player.playback
 
 import android.content.Context
+import android.os.Handler
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -18,7 +20,22 @@ import com.moyamuzyka.player.audio.DspAudioSink
  */
 @UnstableApi
 class PlayerHolder(val player: ExoPlayer, private val sink: DspAudioSink) {
-    fun applyState(state: AudioState) = sink.updateState(state)
+
+    private val handler = Handler(player.applicationLooper)
+
+    /**
+     * Применить состояние: DSP (из любого потока) и скорость воспроизведения («Скорость» из Лаборатории,
+     * тон сохраняется). Команды плеера выполняются в его потоке приложения.
+     */
+    fun applyState(state: AudioState) {
+        sink.updateState(state)
+        val rate = state.lab.playbackRate()
+        handler.post {
+            if (player.playbackParameters.speed != rate) {
+                player.playbackParameters = PlaybackParameters(rate, 1f)
+            }
+        }
+    }
 }
 
 /**
