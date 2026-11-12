@@ -1,0 +1,426 @@
+package com.moyamuzyka.player.audio.dsp
+
+import com.moyamuzyka.player.audio.ReverbConfig
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
+
+/* ======================= ИМПУЛЬСНАЯ ХАРАКТЕРИСТИКА (HTML: fxIRBuild) ======================= */
+object ReverbImpulse {
+
+    /**
+     * Генерация стерео-IR строго по формуле эталона:
+     *  длина = 0.3 + Размер/100 * 3.7 с, огибающая exp(-6.9 t), «Затухание» (damping) —
+     *  однополюсный фильтр с al = 1 - dm*0.92*min(1, 2.5 t), «Ширина» — доля независимого шума L/R.
+     * v = [Размер, Затухание, Предзадержка, Ширина, Тон, Микс] (0..100).
+     */
+    fun build(v: IntArray, sampleRate: Int, rnd: Random): Array<FloatArray> {
+        val n = floor(sampleRate * (0.3 + v[0] / 100.0 * 3.7)).toInt()
+        val dm = v[1] / 100.0
+        val w = v[3] / 100.0
+        val left = FloatArray(n)
+        val right = FloatArray(n)
+        var yl = 0.0
+        var yr = 0.0
+        for (i in 0 until n) {
+            val t = i.toDouble() / n
+            val env = exp(-6.9 * t)
+            val al = 1.0 - dm * 0.92 * min(1.0, t * 2.5)
+            val c = rnd.nextDouble() * 2.0 - 1.0
+            val x = c * (1.0 - w) + (rnd.nextDouble() * 2.0 - 1.0) * w
+            val y = c * (1.0 - w) + (rnd.nextDouble() * 2.0 - 1.0) * w
+            yl += al * (x - yl)
+            yr += al * (y - yr)
+            left[i] = (yl * env).toFloat()
+            right[i] = (yr * env).toFloat()
+        }
+        return arrayOf(left, right)
+    }
+
+    /**
+     * Нормализация IR. В эталоне ConvolverNode работает с normalize = true (значение по умолчанию),
+     * поэтому уровень «мокрого» сигнала зависит от этой калибровки. Формула как в Web Audio:
+     * 1/RMS * 10^(-58/20) * (44100/sampleRate), нижняя граница мощности 0.000125.
+     */
+    fun normalizationScale(ir: Array<FloatArray>, sampleRate: Int): Float {
+        var sum = 0.0
+        for (ch in ir) for (x in ch) sum += x.toDouble() * x
+        var power = sqrt(sum / (ir.size * ir[0].size))
+        if (!power.isFinite() || power < 0.000125) power = 0.000125
+        var scale = 1.0 / power
+        scale *= 10.0.pow(-58.0 * 0.05)
+        scale *= 44100.0 / sampleRate
+        if (ir.size == 4) scale *= 0.5
+        return scale.toFloat()
+    }
+
+    /** Эталон пересобирает IR только при изменении Размера, Затухания и Ширины (индексы 0, 1, 3). */
+    fun needsRebuild(old: IntArray, new: IntArray) =
+        old[0] != new[0] || old[1] != new[1] || old[3] != new[3]
+}
+
+/* ======================= БПФ ======================= */
+internal class Fft(private val size: Int) {
+    private val cosT = FloatArray(size / 2)
+    private val sinT = FloatArray(size / 2)
+    private val rev = IntArray(size)
+
+    init {
+        require(size >= 2 && (size and (size - 1)) == 0) { "Размер БПФ должен быть степенью двойки" }
+        for (k in 0 until size / 2) {
+            cosT[k] = cos(2.0 * PI * k / size).toFloat()
+            sinT[k] = sin(2.0 * PI * k / size).toFloat()
+        }
+        val bits = Integer.numberOfTrailingZeros(size)
+        for (i in 0 until size) rev[i] = Integer.reverse(i) ushr (32 - bits)
+    }
+
+    /** Комплексное БПФ на месте. Обратное — с нормировкой 1/size. */
+    fun transform(re: FloatArray, im: FloatArray, inverse: Boolean) {
+        for (i in 0 until size) {
+            val j = rev[i]
+            if (j > i) {
+                val tr = re[i]; re[i] = re[j]; re[j] = tr
+                val ti = im[i]; im[i] = im[j]; im[j] = ti
+            }
+        }
+        var len = 2
+        while (len <= size) {
+            val half = len shr 1
+            val step = size / len
+            var i = 0
+            while (i < size) {
+                var k = 0
+                for (j in i until i + half) {
+                    val wr = cosT[k]
+                    val wi = if (inverse) sinT[k] else -sinT[k]
+                    val xr = re[j + half] * wr - im[j + half] * wi
+                    val xi = re[j + half] * wi + im[j + half] * wr
+                    re[j + half] = re[j] - xr
+                    im[j + half] = im[j] - xi
+                    re[j] += xr
+                    im[j] += xi
+                    k += step
+                }
+                i += len
+            }
+            len = len shl 1
+        }
+        if (inverse) {
+            val s = 1f / size
+            for (i in 0 until size) { re[i] *= s; im[i] *= s }
+        }
+    }
+}
+
+/* ======================= РАЗБИТАЯ СВЁРТКА (UPOLS, overlap-save) ======================= */
+/**
+ * Равномерно-разбитая свёртка в частотной области. Подходит для длинных IR (до 4 с на 192 кГц)
+ * при небольшой нагрузке на CPU и RAM (спектры в Float).
+ * Канал L сворачивается с IR_L, канал R — с IR_R (как ConvolverNode со стерео-IR).
+ * Собственная задержка: [blockSize] кадров.
+ */
+internal class PartitionedConvolver(ir: Array<FloatArray>, val blockSize: Int, scale: Float) {
+    private val ch = ir.size
+    private val m = blockSize * 2
+    private val bins = blockSize + 1
+    private val fft = Fft(m)
+    private val parts = (ir[0].size + blockSize - 1) / blockSize
+
+    private val h = Array(ch) { Array(parts) { FloatArray(2 * bins) } }
+    private val fdl = Array(ch) { Array(parts) { FloatArray(2 * bins) } }
+    private var head = 0
+    private val inFrame = Array(ch) { FloatArray(m) }
+    private val outBlock = Array(ch) { FloatArray(blockSize) }
+    private var pos = 0
+
+    private val re = FloatArray(m)
+    private val im = FloatArray(m)
+    private val accRe = FloatArray(bins)
+    private val accIm = FloatArray(bins)
+
+    init {
+        for (c in 0 until ch) {
+            for (p in 0 until parts) {
+                re.fill(0f); im.fill(0f)
+                val start = p * blockSize
+                val len = min(blockSize, ir[c].size - start)
+                for (i in 0 until len) re[i] = ir[c][start + i] * scale
+                fft.transform(re, im, false)
+                val dst = h[c][p]
+                for (k in 0 until bins) { dst[2 * k] = re[k]; dst[2 * k + 1] = im[k] }
+            }
+        }
+    }
+
+    fun reset() {
+        for (c in 0 until ch) {
+            for (p in 0 until parts) fdl[c][p].fill(0f)
+            inFrame[c].fill(0f)
+            outBlock[c].fill(0f)
+        }
+        head = 0
+        pos = 0
+    }
+
+    /** Обработка на месте. Данные — interleaved, число каналов равно числу каналов IR. */
+    fun process(data: FloatArray, frames: Int) {
+        var idx = 0
+        for (i in 0 until frames) {
+            for (c in 0 until ch) {
+                inFrame[c][blockSize + pos] = data[idx + c]
+                data[idx + c] = outBlock[c][pos]
+            }
+            pos++
+            idx += ch
+            if (pos == blockSize) {
+                computeBlock()
+                pos = 0
+            }
+        }
+    }
+
+    private fun computeBlock() {
+        head = if (head == 0) parts - 1 else head - 1
+        for (c in 0 until ch) {
+            val x = inFrame[c]
+            System.arraycopy(x, 0, re, 0, m)
+            im.fill(0f)
+            fft.transform(re, im, false)
+
+            val slot = fdl[c][head]
+            for (k in 0 until bins) { slot[2 * k] = re[k]; slot[2 * k + 1] = im[k] }
+
+            accRe.fill(0f); accIm.fill(0f)
+            val hc = h[c]
+            val fc = fdl[c]
+            for (p in 0 until parts) {
+                var s = head + p
+                if (s >= parts) s -= parts
+                val xs = fc[s]
+                val hs = hc[p]
+                var j = 0
+                for (k in 0 until bins) {
+                    val xr = xs[j]; val xi = xs[j + 1]
+                    val hr = hs[j]; val hi = hs[j + 1]
+                    accRe[k] += xr * hr - xi * hi
+                    accIm[k] += xr * hi + xi * hr
+                    j += 2
+                }
+            }
+
+            // Восстановление полного спектра по сопряжённой симметрии
+            for (k in 0 until bins) { re[k] = accRe[k]; im[k] = accIm[k] }
+            for (k in 1 until blockSize) { re[m - k] = accRe[k]; im[m - k] = -accIm[k] }
+            fft.transform(re, im, true)
+
+            // Overlap-save: валидна вторая половина
+            System.arraycopy(re, blockSize, outBlock[c], 0, blockSize)
+            // Сдвиг входного окна
+            System.arraycopy(x, blockSize, x, 0, blockSize)
+        }
+    }
+}
+
+/* ======================= ПРЕДЗАДЕРЖКА (HTML: DelayNode) ======================= */
+/** Линия задержки с дробным временем и плавным изменением (как setTargetAtTime). */
+internal class SmoothDelay(private val channels: Int, private val sampleRate: Int, maxDelayS: Double) {
+    private val size = (maxDelayS * sampleRate).toInt() + 4
+    private val buf = FloatArray(size * channels)
+    private var w = 0
+    private var cur = 0.0
+    private var target = 0.0
+    private val k = 1.0 - exp(-1.0 / (TAU * sampleRate))
+
+    fun set(delayS: Double, immediate: Boolean) {
+        target = delayS.coerceIn(0.0, (size - 4).toDouble() / sampleRate) * sampleRate
+        if (immediate) cur = target
+    }
+
+    fun reset() { buf.fill(0f); w = 0; cur = target }
+
+    fun process(data: FloatArray, frames: Int) {
+        var idx = 0
+        for (i in 0 until frames) {
+            cur += (target - cur) * k
+            for (c in 0 until channels) buf[w * channels + c] = data[idx + c]
+            var rp = w - cur
+            if (rp < 0) rp += size
+            if (rp >= size) rp -= size   // при крошечном cur сумма может округлиться ровно до size
+            val i0 = floor(rp).toInt()
+            val f = (rp - i0).toFloat()
+            val i1 = if (i0 + 1 >= size) 0 else i0 + 1
+            for (c in 0 until channels) {
+                data[idx + c] = buf[i0 * channels + c] * (1f - f) + buf[i1 * channels + c] * f
+            }
+            w++
+            if (w == size) w = 0
+            idx += channels
+        }
+    }
+
+    private companion object { const val TAU = 0.03 }
+}
+
+/* ======================= РЕВЕРБЕРАЦИЯ (вся ветка эталона: pd → convolver → lowpass → wet / dry) ======================= */
+/**
+ * Цепочка точно как в эталоне:
+ *   вход → dry (1 − Микс·0.55) ─────────────────────────────┐
+ *   вход → предзадержка → свёртка(IR) → lowpass(Тон) → wet (Микс·2.8) ─┴→ выход
+ *
+ * Требования: стерео (2 канала), interleaved float, обработка на месте.
+ *
+ * Потоки: [setValues] и [setImpulse] вызываются из потока управления/фона
+ * (setImpulse тяжёлый — генерация и БПФ IR, вызывать не из аудио-потока, с debounce ~140 мс как в эталоне),
+ * [process] — из аудио-потока. Обмен через volatile-ссылки.
+ *
+ * Собственная задержка свёртки (blockSize кадров, ~21 мс) вычитается из предзадержки,
+ * если предзадержка больше неё. При смене IR старая и новая свёртки плавно
+ * перекрёстно затухают в течение одного блока (без щелчка, в отличие от эталона).
+ */
+class Reverb(private val sampleRate: Int) {
+
+    private class Params(val delayS: Double, val lowpassHz: Double, val wet: Double, val dry: Double)
+
+    private val blockSize = if (sampleRate > 96000) 2048 else 1024
+    private val convLatencyS = blockSize.toDouble() / sampleRate
+
+    private val delay = SmoothDelay(CH, sampleRate, 0.25)
+    private val lowpass = Biquad(BiquadType.LOWPASS, CH, sampleRate)
+
+    @Volatile private var pendingParams: Params? = null
+    @Volatile private var pendingConv: PartitionedConvolver? = null
+
+    private var appliedParams: Params? = null
+    private var active: PartitionedConvolver? = null
+    private var fading: PartitionedConvolver? = null
+    private var fadePos = 0
+
+    private val gainK = 1.0 - exp(-1.0 / (GAIN_TAU * sampleRate))
+    private var wetCur = 0.0
+    private var dryCur = 1.0
+    private var wetTarget = 0.0
+    private var dryTarget = 1.0
+    private var wasBypassed = true
+
+    private var scratchA = FloatArray(0)
+    private var scratchB = FloatArray(0)
+
+    /** Применить значения ручек (v = [Размер, Затухание, Предзадержка, Ширина, Тон, Микс]) и вкл/выкл. */
+    fun setValues(v: IntArray, on: Boolean) {
+        val delayS = max(0.0, ReverbConfig.preDelayS(v) - convLatencyS)
+        pendingParams = Params(
+            delayS, ReverbConfig.lowpassHz(v),
+            ReverbConfig.wetGain(v, on), ReverbConfig.dryGain(v, on)
+        )
+    }
+
+    /** Сгенерировать и подготовить новый IR. Тяжёлая операция — вызывать вне аудио-потока. */
+    fun setImpulse(v: IntArray) {
+        val ir = ReverbImpulse.build(v, sampleRate, Random.Default)
+        val scale = ReverbImpulse.normalizationScale(ir, sampleRate)
+        pendingConv = PartitionedConvolver(ir, blockSize, scale)
+    }
+
+    /** Полный сброс состояния (при смене трека/перемотке). */
+    fun reset() {
+        active?.reset(); fading = null
+        delay.reset(); lowpass.reset()
+        wasBypassed = true
+    }
+
+    private fun applyParams(p: Params) {
+        val first = appliedParams == null
+        appliedParams = p
+        delay.set(p.delayS, first)
+        if (first) lowpass.set(p.lowpassHz, 0.7, 0.0) else lowpass.setTarget(p.lowpassHz, 0.7, 0.0, 0.03)
+        wetTarget = p.wet
+        dryTarget = p.dry
+        if (first) { wetCur = p.wet; dryCur = p.dry }
+    }
+
+    fun process(data: FloatArray, frames: Int) {
+        val np = pendingParams
+        if (np != null && np !== appliedParams) applyParams(np)
+        val nc = pendingConv
+        if (nc != null) {
+            pendingConv = null
+            fading = active
+            active = nc
+            fadePos = 0
+        }
+
+        val conv = active ?: return                 // IR ещё не готов — звук идёт без изменений
+
+        // Реверб выключен и «хвост» затух: только плавное выравнивание dry-гейна
+        if (wetTarget == 0.0 && wetCur < 1e-5) {
+            var idx = 0
+            for (i in 0 until frames) {
+                dryCur += (dryTarget - dryCur) * gainK
+                data[idx] = (data[idx] * dryCur).toFloat()
+                data[idx + 1] = (data[idx + 1] * dryCur).toFloat()
+                idx += CH
+            }
+            wasBypassed = true
+            return
+        }
+        if (wasBypassed) {
+            delay.reset(); lowpass.reset(); conv.reset()
+            wasBypassed = false
+        }
+
+        val n = frames * CH
+        if (scratchA.size < n) { scratchA = FloatArray(n); scratchB = FloatArray(n) }
+        val wet = scratchA
+        System.arraycopy(data, 0, wet, 0, n)
+
+        // 1) предзадержка
+        delay.process(wet, frames)
+
+        // 2) свёртка (с плавным переходом при смене IR)
+        val old = fading
+        if (old != null) {
+            System.arraycopy(wet, 0, scratchB, 0, n)
+            conv.process(wet, frames)
+            old.process(scratchB, frames)
+            for (i in 0 until frames) {
+                val a = min(1.0, (fadePos + i).toDouble() / blockSize).toFloat()
+                val j = i * CH
+                wet[j] = wet[j] * a + scratchB[j] * (1f - a)
+                wet[j + 1] = wet[j + 1] * a + scratchB[j + 1] * (1f - a)
+            }
+            fadePos += frames
+            if (fadePos >= blockSize) fading = null
+        } else {
+            conv.process(wet, frames)
+        }
+
+        // 3) lowpass «Тон»
+        lowpass.process(wet, frames)
+
+        // 4) микс dry / wet
+        var idx = 0
+        for (i in 0 until frames) {
+            wetCur += (wetTarget - wetCur) * gainK
+            dryCur += (dryTarget - dryCur) * gainK
+            data[idx] = (data[idx] * dryCur + wet[idx] * wetCur).toFloat()
+            data[idx + 1] = (data[idx + 1] * dryCur + wet[idx + 1] * wetCur).toFloat()
+            idx += CH
+        }
+        if (abs(wetCur - wetTarget) < 1e-6) wetCur = wetTarget
+    }
+
+    private companion object {
+        const val CH = 2
+        /** Постоянная времени сглаживания гейнов (как setTargetAtTime(..., .03) в эталоне). */
+        const val GAIN_TAU = 0.03
+    }
+}
