@@ -6,6 +6,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.moyamuzyka.player.audio.AudioState
+import com.moyamuzyka.player.audio.dsp.HeadphoneBass
 import com.moyamuzyka.player.playback.PlayerFactory
 import com.moyamuzyka.player.playback.PlayerHolder
 
@@ -34,6 +35,7 @@ object AudioStateStore {
     }
 
     fun commit() {
+        HeadphoneBass.sync(state)      // профиль наушников выбирает свой бас-режим (hpBass в эталоне)
         applier?.invoke(state)
     }
 }
